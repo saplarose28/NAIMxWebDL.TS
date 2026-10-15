@@ -5,27 +5,108 @@ on:
   workflow_dispatch:
     inputs:
       stream_url:
-        description: "Stream URL"
+        description: "Direct MPEG-TS Stream URL"
         required: true
         type: string
 
+      part_size_gb:
+        description: "Auto split size per file (GB)"
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+          - "8"
+        default: "4"
+
+      max_runtime_minutes:
+        description: "Maximum recording duration in minutes"
+        required: true
+        type: choice
+        options:
+          - "30"
+          - "60"
+          - "120"
+          - "180"
+          - "240"
+          - "300"
+          - "350"
+        default: "350"
+
+      auto_reconnect:
+        description: "Reconnect automatically after stream disconnect"
+        required: true
+        type: boolean
+        default: true
+
+      upload_to_gofile:
+        description: "Upload completed parts to Gofile"
+        required: true
+        type: boolean
+        default: true
+
 permissions:
   contents: read
+
+concurrency:
+  group: mpegts-recorder
+  cancel-in-progress: false
 
 jobs:
   record:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     env:
       STREAM_URL: ${{ inputs.stream_url }}
+      PART_SIZE_GB: ${{ inputs.part_size_gb }}
+      MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
+      AUTO_RECONNECT: ${{ inputs.auto_reconnect }}
+      UPLOAD_TO_GOfILE: ${{ inputs.upload_to_gofile }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-requests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-requests ffmpeg
+
+      - name: Validate configuration
+        run: |
+          test -n "$STREAM_URL"
+          test -n "$TELEGRAM_BOT_TOKEN"
+          test -n "$TELEGRAM_CHAT_ID"
+
+      - name: Show selected options
+        run: |
+          echo "Part size: ${PART_SIZE_GB} GB"
+          echo "Maximum runtime: ${MAX_RUNTIME_MINUTES} minutes"
+          echo "Auto reconnect: ${AUTO_RECONNECT}"
+          echo "Gofile upload: ${UPLOAD_TO_GOfILE}"
 
       - name: Run recorder
         run: python3 gh_record.py
+
+      - name: Show diagnostic logs
+        if: always()
+        run: |
+          if [ -f recorder.log ]; then
+            tail -n 200 recorder.log
+          fi
+
+      - name: Save diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-diagnostics
+          path: recorder.log
+          if-no-files-found: ignore
+          retention-days: 3
