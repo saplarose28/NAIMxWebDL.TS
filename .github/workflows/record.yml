@@ -3,64 +3,29 @@ name: MPEG-TS Recorder
 
 on:
   workflow_dispatch:
+    inputs:
+      stream_url:
+        description: "Stream URL"
+        required: true
+        type: string
 
 permissions:
   contents: read
-
-concurrency:
-  group: mpegts-recorder
-  cancel-in-progress: false
 
 jobs:
   record:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
-      STREAM_URL: ${{ secrets.STREAM_URL }}
+      STREAM_URL: ${{ inputs.stream_url }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install FFmpeg and Python
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-requests ffmpeg
-
-      - name: Validate configuration
-        run: |
-          test -n "$STREAM_URL" || {
-            echo "STREAM_URL secret is missing"
-            exit 1
-          }
-          test -n "$TELEGRAM_BOT_TOKEN" || {
-            echo "TELEGRAM_BOT_TOKEN secret is missing"
-            exit 1
-          }
-          test -n "$TELEGRAM_CHAT_ID" || {
-            echo "TELEGRAM_CHAT_ID secret is missing"
-            exit 1
-          }
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-requests
 
       - name: Run recorder
         run: python3 gh_record.py
-
-      - name: Show recorder logs
-        if: always()
-        run: |
-          if [ -f recorder.log ]; then
-            tail -n 200 recorder.log
-          fi
-
-      - name: Upload diagnostic logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: recorder-diagnostics
-          path: |
-            recorder.log
-          if-no-files-found: ignore
-          retention-days: 3
