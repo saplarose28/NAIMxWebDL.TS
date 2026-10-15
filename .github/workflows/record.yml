@@ -1,0 +1,50 @@
+name: MPEG-TS Recorder
+
+on:
+  workflow_dispatch:
+    inputs:
+      stream_url:
+        description: "Direct MPEG-TS HTTP(S) URL"
+        required: true
+        type: string
+      segment_seconds:
+        description: "Length of each TS file in seconds"
+        required: true
+        default: "600"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mpegts-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      STREAM_URL: ${{ inputs.stream_url }}
+      SEGMENT_SECONDS: ${{ inputs.segment_seconds }}
+      MAX_RUNTIME_MINUTES: "350"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip
+          python3 -m pip install --user requests --break-system-packages
+
+      - name: Start MPEG-TS recorder
+        run: python3 gh_record.py
+
+      - name: Show FFmpeg version
+        if: always()
+        run: ffmpeg -version | head -n 2
