@@ -1,17 +1,8 @@
+
 name: MPEG-TS Recorder
 
 on:
   workflow_dispatch:
-    inputs:
-      stream_url:
-        description: "Direct MPEG-TS HTTP(S) URL"
-        required: true
-        type: string
-      segment_seconds:
-        description: "Length of each TS file in seconds"
-        required: true
-        default: "600"
-        type: string
 
 permissions:
   contents: read
@@ -26,9 +17,7 @@ jobs:
     timeout-minutes: 360
 
     env:
-      STREAM_URL: ${{ inputs.stream_url }}
-      SEGMENT_SECONDS: ${{ inputs.segment_seconds }}
-      MAX_RUNTIME_MINUTES: "350"
+      STREAM_URL: ${{ secrets.STREAM_URL }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -36,15 +25,42 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg and Python dependencies
+      - name: Install FFmpeg and Python
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip
-          python3 -m pip install --user requests --break-system-packages
+          sudo apt-get install -y python3 python3-requests ffmpeg
 
-      - name: Start MPEG-TS recorder
+      - name: Validate configuration
+        run: |
+          test -n "$STREAM_URL" || {
+            echo "STREAM_URL secret is missing"
+            exit 1
+          }
+          test -n "$TELEGRAM_BOT_TOKEN" || {
+            echo "TELEGRAM_BOT_TOKEN secret is missing"
+            exit 1
+          }
+          test -n "$TELEGRAM_CHAT_ID" || {
+            echo "TELEGRAM_CHAT_ID secret is missing"
+            exit 1
+          }
+
+      - name: Run recorder
         run: python3 gh_record.py
 
-      - name: Show FFmpeg version
+      - name: Show recorder logs
         if: always()
-        run: ffmpeg -version | head -n 2
+        run: |
+          if [ -f recorder.log ]; then
+            tail -n 200 recorder.log
+          fi
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-diagnostics
+          path: |
+            recorder.log
+          if-no-files-found: ignore
+          retention-days: 3
