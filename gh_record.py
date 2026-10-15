@@ -1,40 +1,63 @@
-
 import os
 import time
-import signal
-import subprocess
+import queue
 import threading
+import logging
 from pathlib import Path
 from datetime import datetime
 
 import requests
 
-# ===== CONFIG =====
+# =============== CONFIG ===============
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
+CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 STREAM_URL = os.environ["STREAM_URL"]
+
+PART_SIZE = 4 * 1024**3
+TS_PACKET_SIZE = 188
+MAX_PART_BYTES = (PART_SIZE // TS_PACKET_SIZE) * TS_PACKET_SIZE
 
 OUTPUT_DIR = Path("recordings")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-SEGMENT_SECONDS = int(os.getenv("SEGMENT_SECONDS", "600"))
-MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "350"))
+GOFILE_URL = "https://upload.gofile.io/uploadfile"
+MAX_RECONNECTS = 10
 
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadfile"
+# =============== LOGGING ===============
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("recorder.log", encoding="utf-8")
+    ]
+)
+log = logging.getLogger("recorder")
 
-session = requests.Session()
-process = None
-started_at = time.time()
-running = True
-uploaded_files = set()
-lock = threading.Lock()
+# =============== STATE ===============
+stop_event = threading.Event()
+split_event = threading.Event()
+upload_queue = queue.Queue()
+state_lock = threading.Lock()
+
+state = {
+    "connected": False,
+    "current_file": "",
+    "current_size": 0,
+    "parts": 0,
+    "bytes_received": 0,
+    "last_error": "None",
+    "started": time.time(),
+}
+
+telegram_session = requests.Session()
+http_session = requests.Session()
 
 
-def telegram(method, data=None, timeout=35):
-    response = session.post(
-        f"{API}/{method}",
-        json=data or {},
+def telegram(method, payload=None, timeout=15):
+    response = telegram_session.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+        json=payload or {},
         timeout=timeout
     )
     response.raise_for_status()
@@ -54,273 +77,417 @@ def send_message(text, keyboard=True):
             "inline_keyboard": [
                 [
                     {"text": "📊 Status", "callback_data": "status"},
-                    {"text": "✂️ Split", "callback_data": "split"},
+                    {"text": "✂️ Split now", "callback_data": "split"}
                 ],
                 [
-                    {"text": "⏹ Stop", "callback_data": "stop"}
+                    {"text": "⏹ Stop & upload", "callback_data": "stop"}
                 ]
             ]
         }
 
-    return telegram("sendMessage", {
-        "chat_id": ALLOWED_CHAT_ID,
-        "text": text,
-        "reply_markup": markup
-    })
-
-
-def start_recording():
-    global process
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_pattern = str(OUTPUT_DIR / f"record_{stamp}_%03d.ts")
-
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-        "-y",
-        "-f", "mpegts",
-        "-i", STREAM_URL,
-        "-map", "0",
-        "-c", "copy",
-        "-f", "segment",
-        "-segment_time", str(SEGMENT_SECONDS),
-        "-reset_timestamps", "1",
-        "-segment_format", "mpegts",
-        output_pattern
-    ]
-
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-
-def stop_recording():
-    global process
-
-    if process and process.poll() is None:
-        process.send_signal(signal.SIGINT)
-
-        try:
-            process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-
-    process = None
-
-
-def upload_file(path):
-    if not path.exists() or path.stat().st_size == 0:
-        return False
-
     try:
-        with path.open("rb") as file_obj:
-            response = requests.post(
-                GOFILE_UPLOAD_URL,
-                files={"file": (path.name, file_obj, "video/mp2t")},
-                timeout=300
-            )
-
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("status") != "ok":
-            raise RuntimeError(str(data))
-
-        link = data.get("data", {}).get("downloadPage", "Link unavailable")
-
-        send_message(
-            f"✅ Upload complete\n"
-            f"File: {path.name}\n"
-            f"Size: {path.stat().st_size / (1024 * 1024):.2f} MB\n"
-            f"Gofile: {link}"
-        )
-
-        uploaded_files.add(str(path))
-        path.unlink(missing_ok=True)
-        return True
-
-    except Exception as error:
-        send_message(f"❌ Upload failed: {path.name}\n{error}")
-        return False
+        telegram("sendMessage", {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "reply_markup": markup,
+            "disable_web_page_preview": True
+        })
+    except Exception as exc:
+        log.error("Telegram message failed: %s", exc)
 
 
-def upload_finished_files(all_files=False):
-    files = sorted(
-        OUTPUT_DIR.glob("*.ts"),
-        key=lambda p: p.stat().st_mtime
-    )
+def authorized(chat_id):
+    return str(chat_id) == CHAT_ID
 
-    # Recording চললে সবচেয়ে নতুন ফাইলটি এখনও লেখা হতে পারে।
-    if not all_files and files:
-        files = files[:-1]
 
-    for path in files:
-        if str(path) not in uploaded_files:
-            upload_file(path)
+def format_bytes(number):
+    number = float(number)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if number < 1024 or unit == "TB":
+            return f"{number:.2f} {unit}"
+        number /= 1024
 
 
 def status_text():
-    elapsed = int(time.time() - started_at)
-    alive = process is not None and process.poll() is None
+    with state_lock:
+        info = state.copy()
 
-    files = list(OUTPUT_DIR.glob("*.ts"))
-    size = sum(f.stat().st_size for f in files if f.exists())
+    elapsed = int(time.time() - info["started"])
+    minutes, seconds = divmod(elapsed, 60)
 
     return (
-        f"📊 Recorder Status\n"
-        f"Recording: {'RUNNING' if alive else 'STOPPED'}\n"
-        f"Uptime: {elapsed // 60} minutes\n"
-        f"Local TS files: {len(files)}\n"
-        f"Local size: {size / (1024 * 1024):.2f} MB"
+        "📡 MPEG-TS RECORDER\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Connection: {'🟢 Connected' if info['connected'] else '🟠 Reconnecting / waiting'}\n"
+        f"Current file: {Path(info['current_file']).name if info['current_file'] else '—'}\n"
+        f"Current size: {format_bytes(info['current_size'])}\n"
+        f"Part limit: approximately {format_bytes(MAX_PART_BYTES)}\n"
+        f"Completed parts: {info['parts']}\n"
+        f"Data written: {format_bytes(info['bytes_received'])}\n"
+        f"Uptime: {minutes}m {seconds}s\n"
+        f"Last error: {info['last_error'][:250]}\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
 
 
-def handle_action(action):
-    global running
+def new_part():
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUT_DIR / f"record_{stamp}_{time.time_ns() % 1000000:06d}.ts"
+    handle = open(path, "wb")
 
+    with state_lock:
+        state["current_file"] = str(path)
+        state["current_size"] = 0
+        state["parts"] += 1
+
+    log.info("Created new part: %s", path.name)
+    return path, handle, 0
+
+
+def finish_part(path, handle, size):
+    handle.close()
+
+    if size > 0:
+        upload_queue.put(path)
+        log.info("Part completed: %s (%s)", path.name, format_bytes(size))
+        send_message(
+            "📦 PART COMPLETED\n"
+            f"File: {path.name}\n"
+            f"Size: {format_bytes(size)}\n"
+            "⬆️ Added to upload queue."
+        )
+
+
+def find_ts_packets(buffer):
+    """Yield aligned 188-byte TS packets from an HTTP byte stream."""
+    while len(buffer) >= TS_PACKET_SIZE:
+        if buffer[0] != 0x47:
+            idx = buffer.find(b"\x47")
+
+            if idx < 0:
+                del buffer[:-TS_PACKET_SIZE]
+                return
+
+            if len(buffer) < idx + TS_PACKET_SIZE + 1:
+                del buffer[:idx]
+                return
+
+            if buffer[idx + TS_PACKET_SIZE] != 0x47:
+                del buffer[:idx + 1]
+                continue
+
+            del buffer[:idx]
+
+        if len(buffer) >= TS_PACKET_SIZE and buffer[0] == 0x47:
+            packet = bytes(buffer[:TS_PACKET_SIZE])
+            del buffer[:TS_PACKET_SIZE]
+            yield packet
+
+
+def record_stream():
+    path, handle, size = new_part()
+    reconnects = 0
+    last_packet_time = time.time()
+    buffer = bytearray()
+
+    while not stop_event.is_set():
+        response = None
+
+        try:
+            log.info("Connecting to MPEG-TS stream")
+
+            response = http_session.get(
+                STREAM_URL,
+                stream=True,
+                headers={"User-Agent": "Mozilla/5.0 MPEGTS-Recorder/1.0"},
+                timeout=(15, 60)
+            )
+            response.raise_for_status()
+
+            with state_lock:
+                state["connected"] = True
+                state["last_error"] = "None"
+
+            send_message("🟢 Stream connected. Recording is active.")
+
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if stop_event.is_set():
+                    break
+
+                if not chunk:
+                    continue
+
+                buffer.extend(chunk)
+
+                for packet in find_ts_packets(buffer):
+                    if stop_event.is_set():
+                        break
+
+                    if split_event.is_set() and size > 0:
+                        finish_part(path, handle, size)
+                        path, handle, size = new_part()
+                        split_event.clear()
+                        send_message("✂️ Manual split complete. New part started.")
+
+                    if size + len(packet) > MAX_PART_BYTES:
+                        finish_part(path, handle, size)
+                        path, handle, size = new_part()
+
+                    handle.write(packet)
+                    size += len(packet)
+                    last_packet_time = time.time()
+
+                    with state_lock:
+                        state["current_size"] = size
+                        state["bytes_received"] += len(packet)
+
+                    if size >= MAX_PART_BYTES:
+                        finish_part(path, handle, size)
+                        path, handle, size = new_part()
+
+            if stop_event.is_set():
+                break
+
+            raise ConnectionError("Stream ended; reconnecting")
+
+        except Exception as exc:
+            log.warning("Stream error: %s", exc)
+
+            with state_lock:
+                state["connected"] = False
+                state["last_error"] = str(exc)
+
+            # Discard incomplete packet bytes before reconnecting.
+            buffer.clear()
+
+            if time.time() - last_packet_time > 10:
+                reconnects += 1
+
+            if reconnects > MAX_RECONNECTS:
+                send_message(
+                    "🔴 Stream failed repeatedly.\n"
+                    "Automatic reconnect limit reached.\n"
+                    "Check the URL and recorder.log."
+                )
+                stop_event.set()
+                break
+
+            delay = min(2 ** min(reconnects, 5), 30)
+            send_message(
+                f"🔄 Stream disconnected.\n"
+                f"Retry: {reconnects}/{MAX_RECONNECTS}\n"
+                f"Next attempt in {delay}s."
+            )
+            stop_event.wait(delay)
+
+        finally:
+            if response is not None:
+                response.close()
+
+    try:
+        if size > 0:
+            finish_part(path, handle, size)
+        else:
+            handle.close()
+            path.unlink(missing_ok=True)
+    except Exception:
+        log.exception("Failed to finalize current part")
+
+
+def upload_one(path):
+    if not path.exists() or path.stat().st_size == 0:
+        return True
+
+    for attempt in range(1, 4):
+        try:
+            send_message(
+                "⬆️ UPLOAD STARTED\n"
+                f"File: {path.name}\n"
+                f"Size: {format_bytes(path.stat().st_size)}\n"
+                f"Attempt: {attempt}/3",
+                keyboard=False
+            )
+
+            with path.open("rb") as file_obj:
+                response = requests.post(
+                    GOFILE_URL,
+                    files={"file": (path.name, file_obj, "video/mp2t")},
+                    timeout=(30, 3600)
+                )
+
+            response.raise_for_status()
+            result = response.json()
+
+            if result.get("status") != "ok":
+                raise RuntimeError(str(result))
+
+            data = result.get("data", {})
+            link = data.get("downloadPage", "Link unavailable")
+
+            send_message(
+                "✅ UPLOAD SUCCESSFUL\n"
+                f"📁 {path.name}\n"
+                f"💾 {format_bytes(path.stat().st_size)}\n"
+                f"🔗 {link}"
+            )
+
+            path.unlink(missing_ok=True)
+            return True
+
+        except Exception as exc:
+            log.exception("Upload failed: %s", path.name)
+            with state_lock:
+                state["last_error"] = f"Upload: {exc}"
+
+            if attempt < 3:
+                time.sleep(attempt * 5)
+
+    send_message(
+        "❌ UPLOAD FAILED\n"
+        f"File: {path.name}\n"
+        "The local file was kept for recovery."
+    )
+    return False
+
+
+def upload_worker():
+    while True:
+        item = upload_queue.get()
+
+        try:
+            if item is None:
+                return
+            upload_one(item)
+        finally:
+            upload_queue.task_done()
+
+
+def handle_action(action):
     if action == "status":
         send_message(status_text())
 
     elif action == "split":
-        send_message("✂️ Splitting recording...")
-        stop_recording()
-        upload_finished_files(all_files=True)
-
-        if running:
-            start_recording()
-            send_message("✅ New MPEG-TS recording started.")
+        split_event.set()
+        send_message(
+            "✂️ SPLIT REQUESTED\n"
+            "The current part will close at the next TS packet, "
+            "then a new file will start."
+        )
 
     elif action == "stop":
-        running = False
-        stop_recording()
-        upload_finished_files(all_files=True)
-        send_message("⏹ Recording stopped. Final upload check complete.")
+        send_message("⏹ STOP REQUESTED\nFinalizing the current file and uploads.")
+        stop_event.set()
 
 
-def authorized(chat_id):
-    return str(chat_id) == ALLOWED_CHAT_ID
+def poll_telegram(offset):
+    updates = telegram("getUpdates", {
+        "offset": offset,
+        "timeout": 2,
+        "allowed_updates": ["message", "callback_query"]
+    }, timeout=8)
 
+    for update in updates:
+        offset = update["update_id"] + 1
 
-def poll_telegram():
-    global running
-
-    offset = None
-
-    while running:
         try:
-            updates = telegram("getUpdates", {
-                "offset": offset,
-                "timeout": 25,
-                "allowed_updates": ["message", "callback_query"]
-            }, timeout=35)
+            callback = update.get("callback_query")
 
-            for update in updates:
-                offset = update["update_id"] + 1
-
-                callback = update.get("callback_query")
-                if callback:
-                    message = callback.get("message", {})
-                    chat_id = message.get("chat", {}).get("id")
-
-                    telegram("answerCallbackQuery", {
-                        "callback_query_id": callback["id"]
-                    })
-
-                    if authorized(chat_id):
-                        handle_action(callback.get("data", ""))
-                    continue
-
-                message = update.get("message", {})
+            if callback:
+                message = callback.get("message", {})
                 chat_id = message.get("chat", {}).get("id")
 
-                if not authorized(chat_id):
-                    continue
+                telegram("answerCallbackQuery", {
+                    "callback_query_id": callback["id"]
+                })
 
-                command = message.get("text", "").strip().lower()
+                if authorized(chat_id):
+                    handle_action(callback.get("data", ""))
+                continue
 
-                if command in ("/start", "/help"):
-                    send_message(
-                        "🎬 MPEG-TS Recorder\n"
-                        "/status - Recording status\n"
-                        "/split - Start a new recording file/session\n"
-                        "/stop - Stop and upload remaining files"
-                    )
+            message = update.get("message", {})
+            chat_id = message.get("chat", {}).get("id")
 
-                elif command == "/status":
-                    send_message(status_text())
+            if not authorized(chat_id):
+                continue
 
-                elif command == "/split":
-                    handle_action("split")
+            command = message.get("text", "").strip().lower()
 
-                elif command == "/stop":
-                    handle_action("stop")
+            if command in ("/start", "/help"):
+                send_message(
+                    "🎬 MPEG-TS RECORDER\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "/status — Show recorder status\n"
+                    "/split — Close current part and start another\n"
+                    "/stop — Stop recording and upload remaining data\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "📦 Part limit: approximately 4 GiB\n"
+                    "☁️ Completed parts upload automatically."
+                )
 
-        except Exception as error:
-            print(f"Telegram polling error: {error}")
-            time.sleep(3)
+            elif command == "/status":
+                send_message(status_text())
 
+            elif command == "/split":
+                handle_action("split")
 
-def periodic_uploader():
-    while running:
-        time.sleep(30)
+            elif command == "/stop":
+                handle_action("stop")
 
-        if not running:
-            break
+        except Exception:
+            log.exception("Failed to process Telegram update")
 
-        try:
-            upload_finished_files(all_files=False)
-        except Exception as error:
-            print(f"Upload worker error: {error}")
+    return offset
 
 
 def main():
-    global running
-
     if not STREAM_URL.startswith(("http://", "https://")):
         raise ValueError("STREAM_URL must be an HTTP(S) MPEG-TS URL")
 
-    start_recording()
+    recorder_thread = threading.Thread(target=record_stream, daemon=True)
+    uploader_thread = threading.Thread(target=upload_worker, daemon=True)
+
+    uploader_thread.start()
+    recorder_thread.start()
 
     send_message(
-        "▶️ MPEG-TS recorder started.\n"
-        f"Segment length: {SEGMENT_SECONDS} seconds"
+        "🚀 RECORDER STARTED\n"
+        "🎞 Input: direct MPEG-TS stream\n"
+        "📦 Part limit: approximately 4 GiB\n"
+        "☁️ Gofile upload: enabled\n"
+        "🔄 Auto-reconnect: enabled"
     )
 
-    threading.Thread(target=periodic_uploader, daemon=True).start()
-
-    deadline = time.time() + MAX_RUNTIME_MINUTES * 60
+    offset = None
 
     try:
-        while running and time.time() < deadline:
-            if process is not None and process.poll() is not None:
-                send_message(
-                    "⚠️ FFmpeg stopped unexpectedly. "
-                    "Check the stream URL and FFmpeg logs."
-                )
-                running = False
+        while not stop_event.is_set():
+            try:
+                offset = poll_telegram(offset)
+            except Exception as exc:
+                log.warning("Telegram polling error: %s", exc)
+                time.sleep(3)
+
+            if not recorder_thread.is_alive():
+                stop_event.set()
                 break
 
-            poll_telegram()
-            time.sleep(0.2)
-
     except KeyboardInterrupt:
-        running = False
+        stop_event.set()
 
     finally:
-        running = False
-        stop_recording()
-        upload_finished_files(all_files=True)
-        print("Recorder finished.")
+        stop_event.set()
+        recorder_thread.join()
+
+        # All final files have now been queued.
+        upload_queue.put(None)
+        upload_queue.join()
+        uploader_thread.join()
+
+        send_message(
+            "🏁 RECORDER STOPPED\n"
+            "The recording process has ended.\n"
+            "Check previous messages for upload results."
+        )
 
 
 if __name__ == "__main__":
