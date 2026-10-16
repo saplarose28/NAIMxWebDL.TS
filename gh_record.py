@@ -189,7 +189,10 @@ def record_stream():
             current = None
             if current_path and current_size:
                 log.info("Closed part %s (%s)", current_path, fmt_bytes(current_size))
-                upload_queue.put(current_path)
+                if UPLOAD_TO_GOFILE:
+                    upload_queue.put(current_path)
+                else:
+                    log.info("Upload disabled; completed part kept locally: %s", current_path)
                 with state_lock:
                     state["parts"] += 1
             current_path = None
@@ -269,7 +272,8 @@ def record_stream():
                 with state_lock:
                     state["last_error"] = msg[:300]
                 log.warning("Stream connection failed: %s", msg)
-                close_part()
+                # Keep the current output part open across transient disconnects.
+                # Only size limit, manual split, stop, or runtime end should close it.
                 if not AUTO_RECONNECT:
                     log.error("AUTO_RECONNECT=false; stopping after stream failure")
                     break
@@ -290,7 +294,8 @@ def record_stream():
             state["recording"] = False
             state["stopping"] = False
             state["current_file"] = ""
-        upload_queue.join()
+        if UPLOAD_TO_GOFILE:
+            upload_queue.join()
         send_message("⏹️ Recording finished.\n" + status_text(), keyboard=False)
 
 
