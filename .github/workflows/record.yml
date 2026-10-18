@@ -1,81 +1,72 @@
-name: TS Stream Recorder
-
+name: Record
 on:
   workflow_dispatch:
     inputs:
-      stream_url:
-        description: "Direct raw MPEG-TS stream URL (.ts or compatible live endpoint)"
-        required: true
-        type: string
-      part_size_gb:
-        description: "Split size in GiB"
-        required: true
-        default: "4"
+      url:
+        description: "m3u8 link. Leave it as ask to send the link in Telegram (keeps it hidden if the repo is public)"
+        required: false
+        default: "ask"
+      minutes:
+        description: "Stop after N minutes (0 = until you press Stop)"
+        default: "0"
+      idle_min:
+        description: "Stop the job when the stream sends no data for N minutes (saves GitHub minutes, 0 = off)"
+        default: "10"
+      stream_type:
+        description: "Link type: auto (finds out itself), hls (.m3u8) or ts (direct MPEG-TS stream)"
         type: choice
-        options: ["1", "2", "3", "4", "5", "6", "8"]
-      max_runtime_minutes:
-        description: "Maximum recording runtime"
-        required: true
-        default: "350"
-        type: choice
-        options: ["30", "60", "90", "120", "180", "240", "300", "350"]
-      auto_reconnect:
-        description: "Reconnect after stream disconnects"
-        required: true
-        default: true
-        type: boolean
-      upload_to_gofile:
-        description: "Upload completed parts to Gofile"
-        required: true
-        default: true
-        type: boolean
+        options:
+          - auto
+          - hls
+          - ts
+        default: auto
+      name:
+        description: "File name"
+        default: "ClipByNaim"
+      part_mb:
+        description: "New file every N MB (4000 = 4 GB, whether that takes 1 hour or 2)"
+        default: "4000"
+      part_min:
+        description: "Optional: also split every N minutes (0 = off, split by size only)"
+        default: "0"
+      referer:
+        description: "Optional: website the link is played on (only if the link needs it)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
-
-concurrency:
-  group: ts-recorder-${{ github.ref }}
-  cancel-in-progress: false
+  actions: write      # lets a very long recording continue in a new run
 
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     env:
-      STREAM_URL: ${{ inputs.stream_url }}
-      PART_SIZE_GB: ${{ inputs.part_size_gb }}
-      MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
-      AUTO_RECONNECT: ${{ inputs.auto_reconnect }}
-      UPLOAD_TO_GOFILE: ${{ inputs.upload_to_gofile }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      CONNECT_TIMEOUT_SECONDS: "20"
-      READ_TIMEOUT_SECONDS: "90"
-      MAX_RECONNECTS: "0"
+      PYTHONUNBUFFERED: "1"
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      URL: ${{ inputs.url }}
+      MINUTES: ${{ inputs.minutes }}
+      IDLE_STOP_MIN: ${{ inputs.idle_min }}
+      STREAM_TYPE: ${{ inputs.stream_type }}
+      NAME: ${{ inputs.name }}
+      PART_MB: ${{ inputs.part_mb }}
+      PART_MIN: ${{ inputs.part_min }}
+      REFERER: ${{ inputs.referer }}
+      OUT_DIR: /mnt/rec
+      MP4_DIR: rec_mp4
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip requests
-      - name: Run recorder
-        run: python -u gh_record.py
-      - name: Upload local recordings as workflow artifacts
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Use the second disk for recording
+        run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
+      - name: Record
+        run: python3 gh_record.py
+      - name: Upload leftovers if cancelled
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ts-recordings-${{ github.run_id }}
-          path: recordings/*.ts
-          if-no-files-found: ignore
-          retention-days: 3
-      - name: Save recorder log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: recorder-log-${{ github.run_id }}
-          path: recorder.log
-          if-no-files-found: ignore
-          retention-days: 7
+        run: python3 gh_record.py finish
