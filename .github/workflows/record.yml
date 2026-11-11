@@ -20,6 +20,14 @@ on:
           - hls
           - ts
         default: auto
+      mode:
+        description: "auto (finds out itself), live (a running stream) or archive (a finished timeshift / catch-up .ts or .m3u8 file: it is downloaded completely, then it stops)"
+        type: choice
+        options:
+          - auto
+          - live
+          - archive
+        default: auto
       name:
         description: "File name"
         default: "ClipByNaim"
@@ -31,6 +39,18 @@ on:
         default: "0"
       referer:
         description: "Optional: website the link is played on (only if the link needs it)"
+        required: false
+        default: ""
+      ticket:
+        description: "Leave empty (used only by the shared bot)"
+        required: false
+        default: ""
+      chat:
+        description: "Leave empty (used only by the shared bot)"
+        required: false
+        default: ""
+      also:
+        description: "Leave empty (used only by the shared bot)"
         required: false
         default: ""
 
@@ -46,6 +66,8 @@ jobs:
       PYTHONUNBUFFERED: "1"
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
+      WORKFLOW_FILE: record.yml
+      LIVE_CARD: "0"            # "0" = animated text panel, "1" = picture card
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
@@ -53,16 +75,53 @@ jobs:
       MINUTES: ${{ inputs.minutes }}
       IDLE_STOP_MIN: ${{ inputs.idle_min }}
       STREAM_TYPE: ${{ inputs.stream_type }}
+      MODE: ${{ inputs.mode }}
       NAME: ${{ inputs.name }}
       PART_MB: ${{ inputs.part_mb }}
       PART_MIN: ${{ inputs.part_min }}
       REFERER: ${{ inputs.referer }}
+      PROXY: ${{ secrets.PROXY }}
       OUT_DIR: /mnt/rec
       MP4_DIR: rec_mp4
     steps:
-      - uses: actions/checkout@v4
-      - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/checkout@v6
+      - name: Install ffmpeg (latest)
+        timeout-minutes: 12
+        run: |
+          # The newest ffmpeg is downloaded straight from GitHub (fast, no apt mirror needed). apt is only the backup.
+          export DEBIAN_FRONTEND=noninteractive
+          have() { command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; }
+          if have; then echo "ffmpeg already installed"; ffmpeg -version | head -1; exit 0; fi
+          echo "== try 1: newest build from GitHub"
+          mkdir -p /tmp/ff && cd /tmp/ff
+          curl -fsSL --retry 3 --connect-timeout 20 --max-time 200 -o ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+            && tar xf ff.tar.xz --strip-components=1 \
+            && sudo cp bin/ffmpeg bin/ffprobe /usr/local/bin/ || true
+          cd - >/dev/null
+          if ! have; then
+            echo "== try 2: apt (switching the Azure mirror that fails to the main Ubuntu one)"
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+            APT="-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo timeout -k 5 60 apt-get $APT update -qq || true
+            sudo timeout -k 5 120 apt-get $APT install -y -qq --no-install-recommends ffmpeg || true
+          fi
+          if ! have; then
+            echo "== try 3: static build"
+            mkdir -p /tmp/ff2 && cd /tmp/ff2
+            curl -fsSL --retry 3 --connect-timeout 20 --max-time 150 -o ff.tar.xz \
+              https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+              && tar xf ff.tar.xz --strip-components=1 \
+              && sudo cp ffmpeg ffprobe /usr/local/bin/ || true
+            cd - >/dev/null
+          fi
+          if have; then ffmpeg -version | head -1; else echo "::error title=ffmpeg could not be installed::All 3 ways failed. Press Re-run jobs once more."; exit 1; fi
+      - name: Picture dashboard tools
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages pillow
+          fc-list 2>/dev/null | grep -qi dejavu || sudo apt-get install -y -qq --no-install-recommends fonts-dejavu-core
       - name: Use the second disk for recording
         run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record
