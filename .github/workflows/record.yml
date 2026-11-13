@@ -42,15 +42,15 @@ on:
         required: false
         default: ""
       ticket:
-        description: "Leave empty (used only by the shared bot)"
+        description: "Set by the Telegram worker (the stream link is kept there, not on GitHub). Leave empty when you start it by hand."
         required: false
         default: ""
       chat:
-        description: "Leave empty (used only by the shared bot)"
+        description: "Set by the Telegram worker: the chat that gets the messages. Empty = your own chat (secret TG_CHAT)."
         required: false
         default: ""
       also:
-        description: "Leave empty (used only by the shared bot)"
+        description: "Set by the Telegram worker: extra chat ids that get a copy of the messages (the owner)."
         required: false
         default: ""
 
@@ -65,9 +65,11 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
-      TG_CHAT: ${{ secrets.TG_CHAT }}
-      WORKFLOW_FILE: record.yml
-      LIVE_CARD: "0"            # "0" = animated text panel, "1" = picture card
+      TG_CHAT: ${{ inputs.chat || secrets.TG_CHAT }}
+      TG_ALSO: ${{ inputs.also }}
+      TICKET: ${{ inputs.ticket }}
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      WORKER_KEY: ${{ secrets.WORKER_KEY }}
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
@@ -116,12 +118,6 @@ jobs:
             cd - >/dev/null
           fi
           if have; then ffmpeg -version | head -1; else echo "::error title=ffmpeg could not be installed::All 3 ways failed. Press Re-run jobs once more."; exit 1; fi
-      - name: Picture dashboard tools
-        continue-on-error: true
-        timeout-minutes: 5
-        run: |
-          python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages pillow
-          fc-list 2>/dev/null | grep -qi dejavu || sudo apt-get install -y -qq --no-install-recommends fonts-dejavu-core
       - name: Use the second disk for recording
         run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record
