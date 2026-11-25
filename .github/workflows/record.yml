@@ -41,6 +41,13 @@ on:
         description: "Optional: website the link is played on (only if the link needs it)"
         required: false
         default: ""
+      player:
+        description: "normal = as always. hlsjs = the link opens only in a browser player: the bot opens it in a browser (hls.js) first and copies what the browser sends"
+        type: choice
+        options:
+          - normal
+          - hlsjs
+        default: normal
       ticket:
         description: "Leave empty (used only by the shared bot)"
         required: false
@@ -70,6 +77,9 @@ jobs:
       MIN_FREE_GB: "12"         # the download waits for uploads when the disk has less free space
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
+      API_ID: ${{ secrets.API_ID }}             # optional: lets clips bigger than 50 MB go as a normal video
+      API_HASH: ${{ secrets.API_HASH }}
+      CLIP_CHAT: ${{ secrets.CLIP_CHAT }}     # optional: channel/group id that gets the cricket clips
       WORKFLOW_FILE: record.yml
       LIVE_CARD: "1"            # "1" = picture dashboard, "0" = text panel
       GH_TOKEN: ${{ github.token }}
@@ -84,6 +94,7 @@ jobs:
       PART_MB: ${{ inputs.part_mb }}
       PART_MIN: ${{ inputs.part_min }}
       REFERER: ${{ inputs.referer }}
+      PLAYER: ${{ inputs.player }}
       PROXY: ${{ secrets.PROXY }}
       OUT_DIR: /mnt/rec
       MP4_DIR: rec_mp4
@@ -126,6 +137,18 @@ jobs:
         run: |
           python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages --upgrade pillow
           python3 -c "import PIL; print('Pillow', PIL.__version__)"
+      - name: Big clip sender (only if API_ID is set)
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          if [ -n "$API_ID" ] && [ -n "$API_HASH" ]; then pip install -q --break-system-packages telethon && echo "telethon ready"; else echo "API_ID not set: clips over 50 MB are compressed instead"; fi
+      - name: Browser for hls.js mode (only when you chose hlsjs)
+        if: inputs.player == 'hlsjs'
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          pip install -q --break-system-packages playwright
+          (command -v google-chrome >/dev/null 2>&1 && google-chrome --version) || python3 -m playwright install --with-deps chromium
       - name: Use the second disk for recording
         run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record
